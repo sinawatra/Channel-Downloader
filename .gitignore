@@ -1,0 +1,4 @@
+node_modules/
+# Holds login cookies. Never commit this.
+.browser-profile/
+.DS_Store
