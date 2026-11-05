@@ -4,8 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node src/server.js",
-    "test": "node --test test/"
+    "start": "node src/main.js",
+    "test": "node --test test/",
+    "test:browser": "node integration/fake-site.js"
   },
   "dependencies": {
     "playwright-core": "^1.50.0"
