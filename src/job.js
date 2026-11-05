@@ -1,5 +1,6 @@
+import { openChannelStore } from './channelStore.js';
 import { crawlChannel } from './crawler.js';
-import { channelDirectory, downloadVideo, existingIds } from './downloader.js';
+import { downloadVideo } from './downloader.js';
 
 const CONCURRENCY = 3;
 
@@ -14,7 +15,15 @@ const OUTCOMES = {
 
 // One channel run: the crawl feeds a queue that a small worker pool drains.
 // Video URLs expire, so downloads start while the crawl is still going.
-export function startJob({ channel, limit, root }) {
+export function startJob({
+  channel,
+  limit,
+  root,
+  profileDir,
+  browserChannel,
+  crawl = crawlChannel,
+  download = downloadVideo,
+}) {
   const controller = new AbortController();
   const { signal } = controller;
   const items = new Map();
@@ -22,15 +31,17 @@ export function startJob({ channel, limit, root }) {
   const workers = new Set();
   let userAgent;
   let cookies = [];
-  let directory = null;
-  let known = new Set();
+  let store = null;
+  let newVideos = 0;
+  let accepting = true;
   let setup = Promise.resolve();
+
+  const limitReached = () => limit > 0 && newVideos >= limit;
 
   const job = {
     running: true,
     status: 'Starting Chrome…',
     needsAttention: false,
-    crawlDone: false,
     directory: null,
     outcome: null,
     error: null,
@@ -39,7 +50,7 @@ export function startJob({ channel, limit, root }) {
     snapshot() {
       const all = [...items.values()];
       const count = (state) => all.filter((item) => item.state === state).length;
-      const rank = { downloading: 0, failed: 1, queued: 2, done: 3, skipped: 4 };
+      const rank = { downloading: 0, failed: 1, unplayable: 2, queued: 3, stopped: 4, done: 5, skipped: 6 };
       return {
         running: job.running,
         status: job.status,
@@ -48,11 +59,12 @@ export function startJob({ channel, limit, root }) {
         outcome: job.outcome,
         error: job.error,
         photoPosts: job.photoPosts,
+        channel: store?.summary() ?? null,
         counts: {
           found: all.length,
           done: count('done'),
           skipped: count('skipped'),
-          failed: count('failed'),
+          failed: count('failed') + count('unplayable'),
           queued: count('queued'),
           downloading: count('downloading'),
         },
@@ -68,7 +80,7 @@ export function startJob({ channel, limit, root }) {
       const video = queue.shift();
       const item = items.get(video.id);
       item.state = 'downloading';
-      const worker = downloadVideo(video, directory, {
+      const worker = download(video, store.directory, {
         signal,
         platform: channel.platform,
         userAgent,
@@ -79,9 +91,15 @@ export function startJob({ channel, limit, root }) {
         },
       }).then(() => {
         item.state = 'done';
+        store.markSaved(video.id);
       }).catch((error) => {
+        if (signal.aborted) {
+          item.state = 'stopped';
+          return;
+        }
         item.state = 'failed';
-        item.error = signal.aborted ? 'Stopped' : error.message;
+        item.error = error.message;
+        store.markFailed(video.id, video.title, error.message);
       }).finally(() => {
         workers.delete(worker);
         pump();
@@ -90,42 +108,59 @@ export function startJob({ channel, limit, root }) {
     }
   };
 
-  const onVideo = (video) => {
-    if (limit && items.size >= limit) return;
-    items.set(video.id, {
-      id: video.id,
-      title: video.title,
-      state: 'queued',
-      received: 0,
-      total: 0,
-    });
-    // Chained so the folder is read once and videos stay in discovery order.
+  const addItem = (id, title, state, error) => {
+    items.set(id, { id, title, state, received: 0, total: 0, ...(error && { error }) });
+  };
+
+  // Chained so the channel folder opens once and posts stay in discovery order.
+  const inOrder = (post, handle) => {
+    if (!accepting) return;
     setup = setup.then(async () => {
-      if (!directory) {
-        directory = await channelDirectory(root, channel.platform, video);
-        job.directory = directory;
-        known = await existingIds(directory);
-      }
-      if (known.has(video.id)) {
-        items.get(video.id).state = 'skipped';
-        return;
-      }
+      store ??= await openChannelStore({
+        root,
+        platform: channel.platform,
+        key: post.channelKey || channel.id,
+        name: post.author || channel.id,
+      });
+      job.directory = store.directory;
+      handle();
+    }).catch((error) => addItem(post.id, post.title, 'failed', error.message));
+  };
+
+  const onVideo = (video) => inOrder(video, () => {
+    if (store.isSaved(video.id)) {
+      addItem(video.id, video.title, 'skipped');
+    } else if (!limitReached()) {
+      newVideos += 1;
+      addItem(video.id, video.title, 'queued');
       queue.push(video);
       pump();
-    }).catch((error) => {
-      items.get(video.id).state = 'failed';
-      items.get(video.id).error = error.message;
+    }
+  });
+
+  const onSkipped = (post) => {
+    if (post.kind === 'photo') {
+      job.photoPosts += 1;
+      return;
+    }
+    inOrder(post, () => {
+      if (store.isSaved(post.id)) return;
+      addItem(post.id, post.title, 'unplayable', 'The site gave no watermark-free video for this post.');
+      store.markUnplayable(post.id, post.title);
     });
   };
 
   (async () => {
     let result;
     try {
-      result = await crawlChannel({
+      result = await crawl({
         channel,
-        limit,
+        profileDir,
+        browserChannel,
         signal,
+        isSatisfied: limitReached,
         onVideo,
+        onSkipped,
         onUserAgent: (value) => { userAgent = value; },
         onCookies: (value) => { cookies = value; },
         onStatus(status, needsAttention = false) {
@@ -133,21 +168,23 @@ export function startJob({ channel, limit, root }) {
           job.needsAttention = needsAttention;
         },
       });
-      job.photoPosts = result.photoPosts;
     } catch (error) {
       job.error = error.message;
     }
 
+    accepting = false;
     job.needsAttention = false;
     job.status = 'Finishing downloads…';
     await setup;
     while (workers.size) await Promise.all(workers);
 
     for (const item of items.values()) {
-      if (item.state === 'queued') {
-        item.state = 'failed';
-        item.error = 'Stopped';
-      }
+      if (item.state === 'queued') item.state = 'stopped';
+    }
+    try {
+      await store?.finishRun(result?.reason ?? 'error');
+    } catch (error) {
+      job.error ??= `Could not save the channel record: ${error.message}`;
     }
     job.outcome = result ? OUTCOMES[result.reason] : null;
     job.status = job.error ? 'Failed' : 'Finished';

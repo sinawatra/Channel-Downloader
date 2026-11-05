@@ -1,11 +1,22 @@
 import { createWriteStream } from 'node:fs';
-import { mkdir, readdir, rename, rm } from 'node:fs/promises';
+import { rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { cookieHeader, idFromFilename, sanitizeName, videoFilename } from './parse.js';
+import { videoFilename } from './files.js';
+import { hostMatches } from './platforms/shared.js';
 
 const ATTEMPTS = 3;
+
+// Applies browser cookie scoping, so cookies only reach hosts they were set for.
+export function cookieHeader(url, cookies) {
+  const { hostname, protocol } = new URL(url);
+  return cookies
+    .filter((c) => (c.domain.startsWith('.') ? hostMatches(hostname, c.domain.slice(1)) : hostname === c.domain))
+    .filter((c) => !c.secure || protocol === 'https:')
+    .map((c) => `${c.name}=${c.value}`)
+    .join('; ');
+}
 
 async function fetchToFile(url, target, { signal, platform, userAgent, cookies, onProgress }) {
   const cookie = platform.sendCookies ? cookieHeader(url, cookies()) : '';
@@ -59,16 +70,4 @@ export async function downloadVideo(video, directory, options) {
     await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
   }
   throw lastError;
-}
-
-export async function channelDirectory(root, platform, video) {
-  const name = sanitizeName(video.author) || 'unknown-channel';
-  const directory = path.join(root, platform.name, name);
-  await mkdir(directory, { recursive: true });
-  return directory;
-}
-
-export async function existingIds(directory) {
-  const names = await readdir(directory);
-  return new Set(names.map(idFromFilename).filter(Boolean));
 }

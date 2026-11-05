@@ -1,26 +1,35 @@
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
-import { parseListResponse } from './parse.js';
+import { nextStep, SCROLL_DELAY_MS } from './crawlPolicy.js';
+import { parseListResponse } from './platforms/index.js';
 
-const PROFILE_DIR = fileURLToPath(new URL('../.browser-profile', import.meta.url));
 const CAPTCHA_SELECTOR = '#captcha_container, .captcha_verify_container, .captcha-verify-container, [id^="captcha-verify"], iframe[src*="verifycenter"], iframe[src*="captcha"]';
-const SCROLL_DELAY_MS = 2000;
-const HINT_AFTER_MS = 30_000;
-const GIVE_UP_AFTER_MS = 180_000;
-// An empty list response is sometimes followed by a good one on the same page load.
-const REFUSED_GRACE_MS = 10_000;
-const MAX_RELOADS = 3;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const waitMessages = (platform) => ({
+  captcha: `${platform.name} is showing a CAPTCHA. Please complete it in the Chrome window.`,
+  login: `${platform.name} only lists this channel for logged-in accounts. Log in in the Chrome window to continue, or press Stop if you have no account.`,
+  idle: 'No new videos yet. Check the Chrome window for a login prompt or CAPTCHA.',
+});
 
 // Opens the channel in a visible Chrome window and reads the post lists the
 // page requests for itself while scrolling. Logins and CAPTCHAs are left for
 // the user to complete in that window; the crawl waits for them.
-export async function crawlChannel({ channel, limit, signal, onStatus, onVideo, onUserAgent, onCookies }) {
+export async function crawlChannel({
+  channel,
+  profileDir,
+  browserChannel,
+  signal,
+  isSatisfied,
+  onStatus,
+  onVideo,
+  onSkipped,
+  onUserAgent,
+  onCookies,
+}) {
   const { platform } = channel;
-  const context = await chromium.launchPersistentContext(path.resolve(PROFILE_DIR), {
-    channel: 'chrome',
+  const context = await chromium.launchPersistentContext(profileDir, {
+    channel: browserChannel,
     headless: false,
     viewport: null,
   });
@@ -32,7 +41,6 @@ export async function crawlChannel({ channel, limit, signal, onStatus, onVideo, 
 
   const seen = new Set();
   let videos = 0;
-  let photoPosts = 0;
   let hasMore = null;
   let lastActivity = Date.now();
   let refusedSince = null;
@@ -55,14 +63,14 @@ export async function crawlChannel({ channel, limit, signal, onStatus, onVideo, 
       if (platform.sendCookies) onCookies(await context.cookies());
       for (const item of body[platform.listKey] ?? []) {
         const id = platform.itemId(item);
-        if (!platform.belongsTo(item, channel.id) || seen.has(id)) continue;
+        if (!id || !platform.belongsTo(item, channel.id) || seen.has(id)) continue;
         seen.add(id);
-        const video = platform.toVideo(item);
-        if (video) {
+        const post = platform.classify(item);
+        if (post.kind === 'video') {
           videos += 1;
-          onVideo(video);
+          onVideo(post.video);
         } else {
-          photoPosts += 1;
+          onSkipped(post);
         }
       }
       // Set last: the main loop ends the crawl on this, so this page must be read first.
@@ -72,6 +80,19 @@ export async function crawlChannel({ channel, limit, signal, onStatus, onVideo, 
     }
   });
 
+  const messages = waitMessages(platform);
+  const reloadPage = async () => {
+    onStatus('Reloading channel…');
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 });
+    lastActivity = Date.now();
+  };
+  const scrollPage = async () => {
+    onStatus(`Browsing channel… ${videos} videos found`);
+    const size = page.viewportSize() ?? await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
+    await page.mouse.move(size.width / 2, size.height / 2);
+    await page.mouse.wheel(0, size.height * 2);
+  };
+
   try {
     onUserAgent(await page.evaluate(() => navigator.userAgent));
     onStatus('Opening channel…');
@@ -79,57 +100,41 @@ export async function crawlChannel({ channel, limit, signal, onStatus, onVideo, 
     lastActivity = Date.now();
 
     while (!closed && !signal.aborted) {
-      if (limit && videos >= limit) return { reason: 'limit', photoPosts };
-      if (hasMore === false) return { reason: 'complete', photoPosts };
-
-      // Comes first and sends no input: reloading or scrolling would disturb the challenge.
-      if (await page.locator(CAPTCHA_SELECTOR).locator('visible=true').count().catch(() => 0)) {
-        lastActivity = Date.now();
-        refusedSince = null;
-        onStatus(`${platform.name} is showing a CAPTCHA. Please complete it in the Chrome window.`, true);
-        await sleep(SCROLL_DELAY_MS);
-        continue;
-      }
-
-      const refused = refusedSince !== null && Date.now() - refusedSince > REFUSED_GRACE_MS;
       const cookies = await context.cookies(platform.origin);
-      const loggedIn = cookies.some((cookie) => cookie.name === 'sessionid' && cookie.value);
-      if (platform.requiresLogin && !loggedIn && (refused || waitingForLogin)) {
-        waitingForLogin = true;
-        onStatus(`${platform.name} only lists this channel for logged-in accounts. Log in in the Chrome window to continue, or press Stop if you have no account.`, true);
-        await sleep(SCROLL_DELAY_MS);
-        continue;
-      }
-      if (waitingForLogin || refused) {
-        if (!waitingForLogin && ++reloads > MAX_RELOADS) return { reason: 'refused', photoPosts };
+      const step = nextStep({
+        satisfied: isSatisfied(),
+        hasMore,
+        captchaVisible: await page.locator(CAPTCHA_SELECTOR).locator('visible=true').count().catch(() => 0) > 0,
+        refusedForMs: refusedSince === null ? null : Date.now() - refusedSince,
+        requiresLogin: platform.requiresLogin,
+        loggedIn: cookies.some((cookie) => cookie.name === 'sessionid' && cookie.value),
+        waitingForLogin,
+        reloads,
+        idleMs: Date.now() - lastActivity,
+      });
+
+      if (step.action === 'finish') return { reason: step.reason };
+      if (step.action === 'wait') {
+        if (step.why === 'captcha') {
+          lastActivity = Date.now();
+          refusedSince = null;
+        }
+        if (step.why === 'login') waitingForLogin = true;
+        onStatus(messages[step.why], true);
+      } else if (step.action === 'reload') {
+        if (step.countsAsRetry) reloads += 1;
         waitingForLogin = false;
         refusedSince = null;
-        onStatus('Reloading channel…');
-        await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 });
-        lastActivity = Date.now();
-        await sleep(SCROLL_DELAY_MS);
-        continue;
+        await reloadPage();
+      } else {
+        await scrollPage();
       }
-
-      const idle = Date.now() - lastActivity;
-      if (idle > GIVE_UP_AFTER_MS) return { reason: 'stalled', photoPosts };
-      if (idle > HINT_AFTER_MS) {
-        // Stop scrolling too, in case this is a prompt the checks above don't recognize.
-        onStatus('No new videos yet. Check the Chrome window for a login prompt or CAPTCHA.', true);
-        await sleep(SCROLL_DELAY_MS);
-        continue;
-      }
-      onStatus(`Browsing channel… ${videos} videos found`);
-
-      const size = page.viewportSize() ?? await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
-      await page.mouse.move(size.width / 2, size.height / 2);
-      await page.mouse.wheel(0, size.height * 2);
       await sleep(SCROLL_DELAY_MS);
     }
-    return { reason: signal.aborted ? 'stopped' : 'browser-closed', photoPosts };
+    return { reason: signal.aborted ? 'stopped' : 'browser-closed' };
   } catch (error) {
     if (closed || signal.aborted) {
-      return { reason: signal.aborted ? 'stopped' : 'browser-closed', photoPosts };
+      return { reason: signal.aborted ? 'stopped' : 'browser-closed' };
     }
     throw error;
   } finally {
