@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Channel Downloader</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f6f4; --panel: #fff; --text: #1c1c1a; --muted: #6b6b66; --line: #e2e2dd;
+    --accent: #c8264b; --accent-text: #fff; --ok: #1f7a4d; --bad: #b3261e; --warn-bg: #fff4d6; --warn-text: #6b4e00;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161615; --panel: #20201f; --text: #efefeb; --muted: #a0a09a; --line: #353533;
+      --accent: #e8476b; --accent-text: #fff; --ok: #5fc794; --bad: #f2877f; --warn-bg: #3d3210; --warn-text: #f4d98a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 -apple-system, "PingFang SC", system-ui, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 40px 16px 64px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 24px; }
+  form { display: grid; grid-template-columns: 1fr 110px auto; gap: 8px; align-items: end; }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  input { width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--text); font: inherit; }
+  button { padding: 10px 16px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--text); font: inherit; cursor: pointer; white-space: nowrap; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+  button:disabled { opacity: .5; cursor: default; }
+  .error { color: var(--bad); margin: 10px 0 0; }
+  .status { margin: 24px 0 12px; padding: 12px 14px; border-radius: 8px; background: var(--panel); border: 1px solid var(--line); }
+  .status.attention { background: var(--warn-bg); color: var(--warn-text); border-color: transparent; font-weight: 600; }
+  .counts { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 12px; }
+  .count { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .count b { display: block; font-size: 20px; font-variant-numeric: tabular-nums; }
+  .count span { font-size: 12px; color: var(--muted); }
+  .folder { display: flex; gap: 12px; justify-content: space-between; align-items: center; margin-bottom: 12px; color: var(--muted); font-size: 13px; }
+  .folder code { overflow-wrap: anywhere; }
+  ul { list-style: none; margin: 0; padding: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  ul:empty { display: none; }
+  li { padding: 10px 12px; border-top: 1px solid var(--line); }
+  li:first-child { border-top: 0; }
+  .row { display: flex; justify-content: space-between; gap: 12px; }
+  .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .state { flex: none; font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .state.done { color: var(--ok); }
+  .state.failed { color: var(--bad); }
+  .why { font-size: 12px; color: var(--bad); }
+  progress { display: block; width: 100%; height: 4px; margin-top: 6px; accent-color: var(--accent); }
+  [hidden] { display: none !important; }
+  @media (max-width: 560px) {
+    form { grid-template-columns: 1fr 1fr; }
+    .url { grid-column: 1 / -1; }
+    .counts { grid-template-columns: repeat(2, 1fr); }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>Channel Downloader</h1>
+  <p class="sub">Paste a TikTok or Douyin channel. A Chrome window opens, browses it, and the videos save to your computer without a watermark. Douyin requires an account; TikTok does not.</p>
+
+  <form id="form">
+    <div class="url">
+      <label for="url">Channel URL</label>
+      <input id="url" required autofocus placeholder="https://www.tiktok.com/@name or https://www.douyin.com/user/MS4w...">
+    </div>
+    <div>
+      <label for="limit">Max videos</label>
+      <input id="limit" type="number" min="1" placeholder="All">
+    </div>
+    <button id="action" class="primary" type="submit">Download</button>
+  </form>
+  <p id="error" class="error" hidden></p>
+
+  <section id="job" hidden>
+    <div id="status" class="status" role="status"></div>
+    <div class="counts">
+      <div class="count"><b id="found">0</b><span>Found</span></div>
+      <div class="count"><b id="done">0</b><span>Downloaded</span></div>
+      <div class="count"><b id="skipped">0</b><span>Already saved</span></div>
+      <div class="count"><b id="failed">0</b><span>Failed</span></div>
+    </div>
+    <div class="folder">
+      <code id="directory"></code>
+      <button id="open" type="button">Open folder</button>
+    </div>
+    <ul id="items"></ul>
+  </section>
+</main>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const LABELS = { queued: 'Waiting', done: 'Saved', skipped: 'Already saved', failed: 'Failed' };
+  let running = false;
+
+  const post = async (path, body) => {
+    const response = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body ?? {}),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error);
+    return data;
+  };
+
+  const megabytes = (bytes) => (bytes / 1048576).toFixed(1);
+
+  function renderItem(item) {
+    const li = document.createElement('li');
+    const row = document.createElement('div');
+    row.className = 'row';
+    const title = document.createElement('span');
+    title.className = 'title';
+    title.textContent = item.title || item.id;
+    const state = document.createElement('span');
+    state.className = `state ${item.state}`;
+    state.textContent = item.state === 'downloading'
+      ? `${megabytes(item.received)}${item.total ? ` / ${megabytes(item.total)}` : ''} MB`
+      : LABELS[item.state];
+    row.append(title, state);
+    li.append(row);
+    if (item.state === 'downloading') {
+      const bar = document.createElement('progress');
+      if (item.total) { bar.max = item.total; bar.value = item.received; }
+      li.append(bar);
+    }
+    if (item.error) {
+      const why = document.createElement('div');
+      why.className = 'why';
+      why.textContent = item.error;
+      li.append(why);
+    }
+    return li;
+  }
+
+  function render({ root, job }) {
+    running = Boolean(job?.running);
+    $('action').textContent = running ? 'Stop' : 'Download';
+    $('action').className = running ? '' : 'primary';
+    $('url').disabled = running;
+    $('limit').disabled = running;
+    $('url').required = !running;
+    $('job').hidden = !job;
+    if (!job) return;
+
+    const notes = [];
+    if (job.outcome) notes.push(job.outcome);
+    if (job.photoPosts) notes.push(`${job.photoPosts} photo posts were skipped.`);
+    if (job.error) notes.push(job.error);
+    $('status').textContent = running ? job.status : notes.join(' ') || job.status;
+    $('status').classList.toggle('attention', job.needsAttention);
+    $('found').textContent = job.counts.found;
+    $('done').textContent = job.counts.done;
+    $('skipped').textContent = job.counts.skipped;
+    $('failed').textContent = job.counts.failed;
+    $('directory').textContent = job.directory ?? root;
+    $('items').replaceChildren(...job.items.map(renderItem));
+  }
+
+  async function poll() {
+    try {
+      render(await (await fetch('/api/state')).json());
+    } catch {
+      $('status').textContent = 'Lost connection to the app. Is it still running?';
+    }
+    setTimeout(poll, 700);
+  }
+
+  $('form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    $('error').hidden = true;
+    try {
+      if (running) await post('/api/stop');
+      else await post('/api/start', { url: $('url').value, limit: $('limit').value });
+    } catch (error) {
+      $('error').textContent = error.message;
+      $('error').hidden = false;
+    }
+  });
+  $('open').addEventListener('click', () => post('/api/open-folder'));
+  poll();
+</script>
+</body>
+</html>
