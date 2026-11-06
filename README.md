@@ -17,6 +17,7 @@ It runs entirely on your own computer. There is no server, account or tracking.
 |---|---|
 | TikTok on macOS | Tested on a real channel, no login needed |
 | Douyin | Built, but real downloads are **not tested yet**. Douyin needs a logged-in account to list a channel |
+| Link Grabber for Douyin | Tested on a real channel on macOS with an Android emulator, no login needed. It gets only the videos Douyin shows logged-out visitors |
 | Windows and Linux | Written to work, but **not tested yet** |
 
 Sites change often, so a site update can break this app. If it does, please open an issue.
@@ -83,6 +84,28 @@ When a run ends, the page tells you whether it reached the end of the channel an
 
 `.channel.json` is the app's record of the channel. It's hidden on macOS and Linux, and you can leave it alone. A channel keeps its folder even if it's renamed.
 
+## Link Grabber (Douyin without an account)
+
+Douyin doesn't let this app download videos without a login. The **Link Grabber** section collects a channel's video links instead, using the Douyin app on an Android emulator. It only gives you links and doesn't download anything.
+
+You also need:
+
+- [Android Studio](https://developer.android.com/studio), with an Android emulator
+- The Douyin app installed on the emulator. Open it once and accept its first-run prompts yourself
+
+To use it:
+
+1. **Start the emulator** from Android Studio's Device Manager. The grabber doesn't start it for you, and it can't run without it.
+2. Paste a channel link, or the whole share message from Douyin, into **Douyin channel link**. You don't need to open the channel yourself.
+3. Click **Grab links**. It takes about 10 seconds per video.
+4. Click **Copy all** when it finishes.
+
+While it runs, don't touch the emulator or copy anything on your computer. It reads each link from the clipboard, which the emulator shares with your computer.
+
+If Douyin shows a login screen, the page asks you to close it with the X in the emulator, or press **Stop**. Links already collected are kept.
+
+**You may not get every video.** Douyin shows logged-out visitors only part of a channel and hides the newest videos, so the page tells you if the list ended early. The grabber relies on the Douyin app's screen layout, so an app update can break it.
+
 ## Good to know
 
 - **Deleted videos come back:** the app treats any video that isn't in the folder as new, so running the channel again downloads any videos you deleted.
@@ -121,6 +144,8 @@ Videos belong to their creators. Only download videos you own or have permission
 
 The app doesn't bypass logins or solve CAPTCHAs. Those stay with you.
 
+If you paste grabbed links into another download site, check that site's terms first. Some don't allow automated or bulk use.
+
 ## Troubleshooting
 
 | What you see | What to do |
@@ -131,6 +156,11 @@ The app doesn't bypass logins or solve CAPTCHAs. Those stay with you.
 | "the site refused" or "stopped returning videos" | Wait a while and run the channel again. Saved videos are skipped |
 | "may be incomplete" | Run the channel again until the page says it reached the end |
 | The port is already in use | Start with another port: `PORT=4600 npm start` |
+| "Could not run adb" | Install Android Studio, or set `ANDROID_HOME` to your Android SDK folder |
+| "No Android emulator is running" | Start an emulator in Android Studio, then try again. The grabber never uses a real phone |
+| "screen isn't supported" | Use an emulator shaped like 1080x2400, such as Medium Phone. Other shapes put Douyin's buttons elsewhere |
+| "the list stopped moving" | Run it again. If it keeps happening, scroll the channel once by hand in the emulator first |
+| "several videos in a row gave no link" | Check that the emulator's clipboard sharing is on and that nothing is covering Douyin, then run it again |
 
 ## Development
 
@@ -160,6 +190,8 @@ src/
   downloader.js    Saves video files
   channelStore.js  The saved record for each channel
   files.js         Safe file and folder names
+  linkGrabber.js   Collects share links from the Douyin app
+  android.js       Controls the Android emulator through adb
   platforms/       One file per site
 public/index.html  The page you use
 test/              Unit tests
