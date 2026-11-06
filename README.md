@@ -90,14 +90,15 @@ Douyin doesn't let this app download videos without a login. The **Link Grabber*
 
 You also need:
 
-- [Android Studio](https://developer.android.com/studio), with an emulator running
+- [Android Studio](https://developer.android.com/studio), with an Android emulator
 - The Douyin app installed on the emulator. Open it once and accept its first-run prompts yourself
 
 To use it:
 
-1. Paste a channel link, or the whole share message from Douyin, into **Douyin channel link**.
-2. Click **Grab links**. It takes about 10 seconds per video.
-3. Click **Copy all** when it finishes.
+1. **Start the emulator** from Android Studio's Device Manager. The grabber doesn't start it for you, and it can't run without it.
+2. Paste a channel link, or the whole share message from Douyin, into **Douyin channel link**. You don't need to open the channel yourself.
+3. Click **Grab links**. It takes about 10 seconds per video.
+4. Click **Copy all** when it finishes.
 
 While it runs, don't touch the emulator or copy anything on your computer. It reads each link from the clipboard, which the emulator shares with your computer.
 
