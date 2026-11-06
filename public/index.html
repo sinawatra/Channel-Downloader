@@ -48,8 +48,14 @@
   .state.failed, .state.unplayable { color: var(--bad); }
   .why { font-size: 12px; color: var(--bad); }
   progress { display: block; width: 100%; height: 4px; margin-top: 6px; accent-color: var(--accent); }
+  .grabber { margin-top: 40px; padding-top: 32px; border-top: 1px solid var(--line); }
+  h2 { font-size: 18px; margin: 0 0 4px; }
+  #grab-form { grid-template-columns: 1fr auto; }
+  .links-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 8px; font-size: 14px; }
+  textarea { display: block; width: 100%; min-height: 240px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--text); font: 13px/1.6 ui-monospace, Menlo, Consolas, monospace; resize: vertical; }
   [hidden] { display: none !important; }
   @media (max-width: 560px) {
+    #grab-form { grid-template-columns: 1fr; }
     form { grid-template-columns: 1fr 1fr; }
     .url { grid-column: 1 / -1; }
     .counts { grid-template-columns: repeat(2, 1fr); }
@@ -89,12 +95,36 @@
     </div>
     <ul id="items"></ul>
   </section>
+
+  <section class="grabber">
+    <h2>Link Grabber</h2>
+    <p class="sub">Collects a Douyin channel's video links, without an account, using the Douyin app on an Android emulator. It only gives you links and downloads nothing. Don't copy anything on this computer or touch the emulator while it runs.</p>
+
+    <form id="grab-form">
+      <div>
+        <label for="grab-url">Douyin channel link</label>
+        <input id="grab-url" required placeholder="https://v.douyin.com/abc/ or https://www.douyin.com/user/MS4w...">
+      </div>
+      <button id="grab-action" class="primary" type="submit">Grab links</button>
+    </form>
+    <p id="grab-error" class="error" hidden></p>
+
+    <div id="grab-job" hidden>
+      <div id="grab-status" class="status" role="status"></div>
+      <div class="links-head">
+        <span id="grab-count"></span>
+        <button id="grab-copy" type="button">Copy all</button>
+      </div>
+      <textarea id="grab-links" readonly aria-label="Collected links" spellcheck="false"></textarea>
+    </div>
+  </section>
 </main>
 
 <script>
   const $ = (id) => document.getElementById(id);
   const LABELS = { queued: 'Waiting', done: 'Saved', skipped: 'Already saved', failed: 'Failed', unplayable: 'Unavailable', stopped: 'Stopped' };
   let running = false;
+  let grabbing = false;
 
   const post = async (path, body) => {
     const response = await fetch(path, {
@@ -147,7 +177,40 @@
     return notes.join(' ');
   }
 
-  function render({ root, job }) {
+  function describeGrab(grab) {
+    const notes = [];
+    if (grab.outcome) notes.push(grab.outcome);
+    if (grab.error) notes.push(grab.error);
+    const accounted = grab.links.length + grab.missed + grab.photoPosts;
+    if (!grab.error && grab.expected > accounted) notes.push(`Douyin says this channel has ${grab.expected} videos, so ${grab.expected - accounted} weren't reached.`);
+    if (grab.newestHidden) notes.push('Douyin hides the newest videos until you log in, so those may be missing.');
+    if (grab.missed) notes.push(`${grab.missed} ${grab.missed === 1 ? 'video' : 'videos'} gave no link.`);
+    if (grab.photoPosts) notes.push(`${grab.photoPosts} photo posts were skipped.`);
+    return notes.join(' ') || grab.status;
+  }
+
+  function renderGrab(grab) {
+    grabbing = Boolean(grab?.running);
+    $('grab-action').textContent = grabbing ? 'Stop' : 'Grab links';
+    $('grab-action').className = grabbing ? '' : 'primary';
+    $('grab-url').disabled = grabbing;
+    $('grab-url').required = !grabbing;
+    $('grab-job').hidden = !grab;
+    if (!grab) return;
+
+    $('grab-status').textContent = grabbing ? grab.status : describeGrab(grab);
+    $('grab-status').classList.toggle('attention', grab.needsAttention);
+    $('grab-count').textContent = grab.expected
+      ? `${grab.links.length} of ${grab.expected} videos`
+      : `${grab.links.length} links`;
+    const text = grab.links.join('\n');
+    // Replacing the value would lose a selection the user is making.
+    if ($('grab-links').value !== text) $('grab-links').value = text;
+    $('grab-copy').disabled = !grab.links.length;
+  }
+
+  function render({ root, job, grab }) {
+    renderGrab(grab);
     running = Boolean(job?.running);
     $('action').textContent = running ? 'Stop' : 'Download';
     $('action').className = running ? '' : 'primary';
@@ -200,6 +263,27 @@
     } catch (error) {
       $('error').textContent = error.message;
       $('error').hidden = false;
+    }
+  });
+  $('grab-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    $('grab-error').hidden = true;
+    try {
+      if (grabbing) await post('/api/links/stop');
+      else await post('/api/links/start', { url: $('grab-url').value });
+    } catch (error) {
+      $('grab-error').textContent = error.message;
+      $('grab-error').hidden = false;
+    }
+  });
+  $('grab-copy').addEventListener('click', async () => {
+    $('grab-links').select();
+    try {
+      await navigator.clipboard.writeText($('grab-links').value);
+      $('grab-copy').textContent = 'Copied';
+      setTimeout(() => { $('grab-copy').textContent = 'Copy all'; }, 1500);
+    } catch {
+      // The links stay selected, so the user can copy them with the keyboard.
     }
   });
   poll();

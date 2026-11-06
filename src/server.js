@@ -1,6 +1,7 @@
 import { mkdir, readFile } from 'node:fs/promises';
 import http from 'node:http';
 import { startJob } from './job.js';
+import { parseGrabUrl, startLinkGrab } from './linkGrabber.js';
 import { parseChannelUrl } from './platforms/index.js';
 
 const INDEX = new URL('../public/index.html', import.meta.url);
@@ -19,8 +20,9 @@ async function readJson(req) {
   return JSON.parse(raw || '{}');
 }
 
-export function createAppServer({ outputRoot, profileDir, browserChannel, openFolder }) {
+export function createAppServer({ outputRoot, profileDir, browserChannel, openFolder, readClipboard }) {
   let job = null;
+  let grab = null;
 
   return http.createServer(async (req, res) => {
     // This server starts a browser and writes files, so only this page may call it.
@@ -38,7 +40,17 @@ export function createAppServer({ outputRoot, profileDir, browserChannel, openFo
         return res.end(await readFile(INDEX));
       }
       if (route === 'GET /api/state') {
-        return sendJson(res, 200, { root: outputRoot, job: job?.snapshot() ?? null });
+        return sendJson(res, 200, { root: outputRoot, job: job?.snapshot() ?? null, grab: grab?.snapshot() ?? null });
+      }
+      if (route === 'POST /api/links/start') {
+        if (grab?.running) return sendJson(res, 409, { error: 'The link grabber is already running.' });
+        const { url } = await readJson(req);
+        grab = startLinkGrab({ url: parseGrabUrl(url), readClipboard });
+        return sendJson(res, 200, { ok: true });
+      }
+      if (route === 'POST /api/links/stop') {
+        grab?.stop();
+        return sendJson(res, 200, { ok: true });
       }
       if (route === 'POST /api/start') {
         if (job?.running) return sendJson(res, 409, { error: 'A download is already running.' });
