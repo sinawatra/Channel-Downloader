@@ -9,6 +9,10 @@ const FOCUS_CHECKS = 15;
 const BACK_CHECKS = 3;
 const TILE_TRIES = 2;
 const CLIPBOARD_CHECKS = 12;
+const SHEET_CHECKS = 8;
+const RESOLVE_TIMEOUT_MS = 10_000;
+const LAYOUT_RATIO = 2400 / 1080;
+const LAYOUT_RATIO_TOLERANCE = 0.03;
 // Otherwise each run stacks another channel page, and reading the screen can return an old one.
 const NEW_CLEARED_TASK = '0x10008000';
 
@@ -16,10 +20,11 @@ const NEW_CLEARED_TASK = '0x10008000';
 const BASE_WIDTH = 1080;
 const SHARE_BUTTON = { x: 1000, y: 1958 };
 const SAME_ROW = 100;
-const TILE_ABOVE_LABEL = 160;
+// High in the tile, because Android's clipboard preview covers the screen's bottom-left corner.
+const TILE_ABOVE_LABEL = 300;
 const TILE_RIGHT_OF_LABEL = 130;
 const GRID_TOP = 300;
-const GRID_BOTTOM = 2250;
+const GRID_BOTTOM = 2100;
 const SHARE_ICON_ABOVE_LABEL = 70;
 const SCROLL_STARTS = [{ x: 540, y: 2200 }, { x: 540, y: 1800 }, { x: 200, y: 1500 }];
 const SCROLL_TOP = 300;
@@ -31,6 +36,8 @@ const OUTCOMES = {
   'too-many-misses': 'Stopped early: several videos in a row gave no link. Check the emulator, then run it again.',
   'no-grid': 'Stopped: could not find any videos on the channel page. Check the emulator, then run it again.',
   'left-channel': 'Stopped: Douyin left the channel page. Check the emulator, then run it again.',
+  incomplete: 'Stopped early: the list stopped moving before every video Douyin lists was reached, so this may be incomplete. Run it again.',
+  unreadable: 'Stopped early: could not read the emulator screen after scrolling, so this may be incomplete. Run it again.',
 };
 
 // The URL ends up in a command run by the emulator's shell, so only plain links get through.
@@ -67,14 +74,15 @@ export function visibleTiles(xml, scale = 1) {
 
 // Scrolling keeps the last row on screen, so drop the tiles already opened.
 export function tilesAfterOverlap(tiles, previousRow) {
-  if (!previousRow.length) return tiles;
+  // Like counts repeat, so skip only on a clear match. Reopening a tile costs time;
+  // wrongly skipping one loses a video.
+  if (previousRow.length < 2) return tiles;
   const labels = tiles.map((tile) => tile.label);
+  const matches = [];
   for (let start = 0; start + previousRow.length <= labels.length; start++) {
-    if (previousRow.every((label, offset) => labels[start + offset] === label)) {
-      return tiles.slice(start + previousRow.length);
-    }
+    if (previousRow.every((label, offset) => labels[start + offset] === label)) matches.push(start);
   }
-  return tiles;
+  return matches.length === 1 ? tiles.slice(matches[0] + previousRow.length) : tiles;
 }
 
 export function lastRow(tiles) {
@@ -113,9 +121,11 @@ const isChannel = (focus) => focus.includes('UserProfileActivity') || focus.incl
 const isVideo = (focus) => focus.includes('UltraDetailActivity');
 
 // Share links redirect to a page naming the video, which is how repeats are spotted.
-export async function resolveShareLink(link, fetchImpl = fetch) {
+export async function resolveShareLink(link, { signal, fetchImpl = fetch } = {}) {
+  const timeout = AbortSignal.timeout(RESOLVE_TIMEOUT_MS);
   const response = await fetchImpl(link, {
     redirect: 'manual',
+    signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
     headers: { 'user-agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36' },
   });
   const match = (response.headers.get('location') ?? '').match(/\/(video|note|slides)\/(\d+)/);
@@ -129,7 +139,7 @@ export function startLinkGrab({
   readClipboard,
   connect = connectDevice,
   resolve = resolveShareLink,
-  delays = { open: 3000, sheet: 700, settle: 400, backSettle: 1200, poll: 200, retry: 1000, scroll: 1200, loadMore: 2500, login: 1000 },
+  delays = { open: 3000, sheet: 400, settle: 400, backSettle: 1200, poll: 200, retry: 1000, scroll: 1200, loadMore: 2500, login: 1000 },
 }) {
   const controller = new AbortController();
   const { signal } = controller;
@@ -146,6 +156,8 @@ export function startLinkGrab({
     newestHidden: false,
     photoPosts: 0,
     missed: 0,
+    repeats: 0,
+    unverified: 0,
     stop: () => controller.abort(),
     snapshot: () => ({
       running: job.running,
@@ -157,6 +169,8 @@ export function startLinkGrab({
       newestHidden: job.newestHidden,
       photoPosts: job.photoPosts,
       missed: job.missed,
+      repeats: job.repeats,
+      unverified: job.unverified,
       links: [...links],
     }),
   };
@@ -169,7 +183,11 @@ export function startLinkGrab({
 
   async function run() {
     const device = await connect();
-    const scale = device.screen.width / BASE_WIDTH;
+    const { width, height } = device.screen;
+    if (Math.abs(height / width - LAYOUT_RATIO) > LAYOUT_RATIO_TOLERANCE) {
+      throw new Error(`This emulator's ${width}x${height} screen isn't supported. Use one shaped like 1080x2400, such as Medium Phone.`);
+    }
+    const scale = width / BASE_WIDTH;
 
     async function waitWhileLoginShows() {
       const resume = job.status;
@@ -197,17 +215,28 @@ export function startLinkGrab({
       return device.focusedWindow();
     }
 
+    let sheetMayBeOpen = false;
+
     async function returnToChannel() {
       for (let attempt = 0; attempt < 6; attempt++) {
         await waitWhileLoginShows();
-        if (isChannel(await device.focusedWindow())) {
+        const focus = await device.focusedWindow();
+        if (isChannel(focus)) {
           // A tile tapped while the video is still closing can open the wrong video.
           if (attempt > 0) await wait(delays.backSettle);
           return true;
         }
-        // The first press often only closes the share sheet, so don't wait long for the channel.
+        // Pressing back while the screen is changing could leave Douyin altogether.
+        if (focus.includes('mCurrentFocus=null')) {
+          await waitForScreen(isChannel);
+          continue;
+        }
+        // A press that only closes the share sheet won't bring the channel back, so
+        // that wait is short. Otherwise the channel is coming, so wait for it.
+        const closingSheet = sheetMayBeOpen;
+        sheetMayBeOpen = false;
         await device.back();
-        await waitForScreen(isChannel, BACK_CHECKS);
+        await waitForScreen(isChannel, closingSheet ? BACK_CHECKS : FOCUS_CHECKS);
       }
       return false;
     }
@@ -235,12 +264,27 @@ export function startLinkGrab({
     // The Share Link option stays in one place, so reading the screen for it is needed only once.
     let shareLinkTarget = null;
 
+    async function waitForSheet(windowsBefore) {
+      for (let check = 0; check < SHEET_CHECKS; check++) {
+        if (await device.windowCount() > windowsBefore) return true;
+        await wait(delays.poll);
+      }
+      return false;
+    }
+
     async function copyLink(previous) {
       for (let attempt = 0; attempt < 3; attempt++) {
+        const windowsBefore = await device.windowCount();
+        sheetMayBeOpen = true;
         await device.tap(SHARE_BUTTON.x * scale, SHARE_BUTTON.y * scale);
-        await wait(delays.sheet);
+        const sheetOpened = await waitForSheet(windowsBefore);
         await waitWhileLoginShows();
-        if (!shareLinkTarget || attempt > 0) {
+        // A tap with no sheet could land on the video's caption and open another page. Reading
+        // the screen here wouldn't help: it blocks for about 12 seconds while a video plays.
+        if (!sheetOpened) continue;
+        if (shareLinkTarget && attempt === 0) {
+          await wait(delays.sheet); // lets the sheet finish sliding in
+        } else {
           await wait(delays.settle);
           const option = findShareLinkOption(await device.readScreen().catch(() => ''));
           if (!option) continue;
@@ -249,9 +293,24 @@ export function startLinkGrab({
         await device.tap(shareLinkTarget.x, shareLinkTarget.y);
         const link = await waitForClipboardLink(previous);
         if (link) return link;
+        // Douyin can reuse a video's short link, so an unchanged clipboard may still be a good copy.
+        if ((await device.readScreen().catch(() => '')).includes('链接已复制')) {
+          const reused = extractShareLink(await readClipboard());
+          if (reused) return reused;
+        }
         shareLinkTarget = null;
       }
       return null;
+    }
+
+    // A failed lookup shouldn't end the run or lose the link, which is still good.
+    async function lookUp(link) {
+      try {
+        return await resolve(link, { signal });
+      } catch {
+        signal.throwIfAborted();
+        return { id: null, isVideo: true };
+      }
     }
 
     async function openTile(tile) {
@@ -276,6 +335,7 @@ export function startLinkGrab({
     let previousLink = extractShareLink(await readClipboard());
     let previousRow = [];
     let misses = 0;
+    let lastVideoId = null;
 
     if (!(await returnToChannel())) return 'left-channel';
     let xml = await readGrid();
@@ -300,21 +360,34 @@ export function startLinkGrab({
 
       for (const tile of tilesAfterOverlap(tiles, previousRow)) {
         job.status = `Collecting links… ${links.length} so far`;
-        // No link or a repeat usually means the tap landed badly, so each tile gets a second try.
+        // No link, or the video just before this one, means the tap landed badly, so try again.
+        // An older repeat is a tile already collected, so opening it again wouldn't help.
         let gotLink = false;
         let gotNew = false;
-        for (let attempt = 0; attempt < TILE_TRIES && !gotNew; attempt++) {
+        let tryAgain = true;
+        for (let attempt = 0; attempt < TILE_TRIES && tryAgain; attempt++) {
           await openTile(tile);
           const link = isVideo(await device.focusedWindow()) ? await copyLink(previousLink) : null;
+          tryAgain = !link;
           if (link) {
             gotLink = true;
             misses = 0;
             previousLink = link;
-            const video = await resolve(link);
-            gotNew = Boolean(video.id && !seen.has(video.id));
-            if (gotNew && video.isVideo) links.push(link);
-            else if (gotNew) job.photoPosts += 1;
-            if (video.id) seen.add(video.id);
+            const video = await lookUp(link);
+            if (!video.id) {
+              gotNew = true;
+              if (!links.includes(link)) {
+                links.push(link);
+                job.unverified += 1;
+              }
+            } else {
+              gotNew = !seen.has(video.id);
+              tryAgain = !gotNew && video.id === lastVideoId;
+              if (gotNew && video.isVideo) links.push(link);
+              else if (gotNew) job.photoPosts += 1;
+              seen.add(video.id);
+              lastVideoId = video.id;
+            }
           }
           if (!(await returnToChannel())) return 'left-channel';
         }
@@ -322,6 +395,8 @@ export function startLinkGrab({
           misses += 1;
           job.missed += 1;
           if (misses >= MAX_MISSES_IN_A_ROW) return 'too-many-misses';
+        } else if (!gotNew) {
+          job.repeats += 1;
         }
       }
 
@@ -333,6 +408,8 @@ export function startLinkGrab({
       // a moment. The page can also ignore a swipe just after a video closes, so one
       // scroll with no change doesn't mean the list has ended.
       let moved = false;
+      let sawGrid = false;
+      let latestScreen = '';
       for (let attempt = 0; attempt < END_OF_LIST_CHECKS && !moved; attempt++) {
         if (attempt > 0) job.status = `Scrolling for more videos… ${links.length} so far`;
         const start = SCROLL_STARTS[attempt % SCROLL_STARTS.length];
@@ -340,15 +417,26 @@ export function startLinkGrab({
         await device.swipe(start.x * scale, from, Math.max(from - distance, SCROLL_TOP * scale), 500);
         await wait(attempt > 0 ? delays.loadMore : delays.scroll);
         if (!(await returnToChannel())) return 'left-channel';
-        const next = visibleTiles(await readGrid(), scale);
+        const screen = await readGrid();
+        const next = visibleTiles(screen, scale);
+        if (next.length) {
+          sawGrid = true;
+          latestScreen = screen;
+        }
         if (next.length && gridFingerprint(next) !== current) {
           tiles = next;
           moved = true;
         }
       }
-      if (!moved) return 'complete';
+      if (!moved) {
+        // A list that stops moving is only finished if every video Douyin lists was accounted for.
+        if (!sawGrid) return 'unreadable';
+        const listed = channelVideoCount(latestScreen);
+        const accounted = seen.size + job.unverified + job.missed;
+        return listed && accounted < listed ? 'incomplete' : 'complete';
+      }
     }
-    return 'complete';
+    return 'incomplete';
   }
 
   (async () => {

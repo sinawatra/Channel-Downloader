@@ -185,6 +185,8 @@
     if (!grab.error && grab.expected > accounted) notes.push(`Douyin says this channel has ${grab.expected} videos, so ${grab.expected - accounted} weren't reached.`);
     if (grab.newestHidden) notes.push('Douyin hides the newest videos until you log in, so those may be missing.');
     if (grab.missed) notes.push(`${grab.missed} ${grab.missed === 1 ? 'video' : 'videos'} gave no link.`);
+    if (grab.repeats) notes.push(`${grab.repeats} ${grab.repeats === 1 ? 'tile' : 'tiles'} opened a video already collected.`);
+    if (grab.unverified) notes.push(`${grab.unverified} ${grab.unverified === 1 ? 'link' : 'links'} couldn't be checked, so there may be repeats or photo posts.`);
     if (grab.photoPosts) notes.push(`${grab.photoPosts} photo posts were skipped.`);
     return notes.join(' ') || grab.status;
   }

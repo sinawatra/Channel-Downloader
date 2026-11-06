@@ -20,7 +20,7 @@ async function readJson(req) {
   return JSON.parse(raw || '{}');
 }
 
-export function createAppServer({ outputRoot, profileDir, browserChannel, openFolder, readClipboard }) {
+export function createAppServer({ outputRoot, profileDir, browserChannel, openFolder, readClipboard, startGrab = startLinkGrab }) {
   let job = null;
   let grab = null;
 
@@ -43,9 +43,10 @@ export function createAppServer({ outputRoot, profileDir, browserChannel, openFo
         return sendJson(res, 200, { root: outputRoot, job: job?.snapshot() ?? null, grab: grab?.snapshot() ?? null });
       }
       if (route === 'POST /api/links/start') {
-        if (grab?.running) return sendJson(res, 409, { error: 'The link grabber is already running.' });
+        // Checked after the await, so a double-click can't start two runs.
         const { url } = await readJson(req);
-        grab = startLinkGrab({ url: parseGrabUrl(url), readClipboard });
+        if (grab?.running) return sendJson(res, 409, { error: 'The link grabber is already running.' });
+        grab = startGrab({ url: parseGrabUrl(url), readClipboard });
         return sendJson(res, 200, { ok: true });
       }
       if (route === 'POST /api/links/stop') {
@@ -53,8 +54,8 @@ export function createAppServer({ outputRoot, profileDir, browserChannel, openFo
         return sendJson(res, 200, { ok: true });
       }
       if (route === 'POST /api/start') {
-        if (job?.running) return sendJson(res, 409, { error: 'A download is already running.' });
         const { url, limit } = await readJson(req);
+        if (job?.running) return sendJson(res, 409, { error: 'A download is already running.' });
         const channel = parseChannelUrl(url);
         const max = Number(limit);
         job = startJob({

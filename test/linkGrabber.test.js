@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { findAdb, parseDevices, parseScreenSize } from '../src/android.js';
+import { connectDevice, findAdb, parseDevices, parseScreenSize } from '../src/android.js';
 import {
   channelVideoCount,
   extractShareLink,
@@ -21,12 +21,14 @@ const finish = async (grab) => {
 const NO_DELAYS = { open: 0, sheet: 0, settle: 0, backSettle: 0, poll: 0, retry: 0, scroll: 0, loadMore: 0, login: 0 };
 
 // Plays the Douyin app: a grid of tiles that opens videos and copies a link for each.
-function fakeDevice({ pages, loginAfterOpens = Infinity, loginStaysFor = 1, noLinkFor = [], installed = true, ignoreFirstTapOf = null, startPage = 0 }) {
+function fakeDevice({ pages, loginAfterOpens = Infinity, loginStaysFor = 1, noLinkFor = [], installed = true, ignoreFirstTapOf = null, startPage = 0, listed = null, screen = { width: 1080, height: 2400 }, sameLink = null, sheetNeverOpensOnce = false }) {
   let ignored = false;
-  const state = { page: startPage, screen: 'channel', opens: 0, loginLeft: 0, sheet: false, current: null, clipboard: 'something else', copies: 0, taps: 0, logins: 0 };
-  const allTiles = pages.map((labels) => visibleTiles(labels.map((label, index) => labelNode(label, 600 + Math.floor(index / 3) * 480, 20 + (index % 3) * 360)).join(''), 1));
+  let sheetSkipped = false;
+  const state = { copied: false, page: startPage, screen: 'channel', opens: 0, loginLeft: 0, sheet: false, current: null, clipboard: 'something else', copies: 0, taps: 0, logins: 0 };
+  const allTiles = pages.map((labels) => visibleTiles(labels.map((label, index) => labelNode(label, 700 + Math.floor(index / 3) * 480, 20 + (index % 3) * 360)).join(''), 1));
   const device = {
-    screen: { width: 1080, height: 2400 },
+    screen,
+    windowCount: async () => (state.sheet ? 21 : 20),
     shell: async (...args) => {
       if (args[0] === 'pm') return installed ? 'package:com.ss.android.ugc.aweme' : '';
       return '';
@@ -52,14 +54,24 @@ function fakeDevice({ pages, loginAfterOpens = Infinity, loginStaysFor = 1, noLi
           state.loginLeft = loginStaysFor;
         }
       } else if (state.screen === 'video' && !state.sheet) {
+        if (y > 2000) {
+          state.blindCaptionTaps = (state.blindCaptionTaps ?? 0) + 1;
+          return;
+        }
+        if (sheetNeverOpensOnce && state.copies > 0 && !sheetSkipped) {
+          sheetSkipped = true;
+          return;
+        }
         state.sheet = true;
       } else if (state.sheet && !noLinkFor.includes(state.current)) {
         state.copies += 1;
-        state.clipboard = `5.38 复制打开抖音 https://v.douyin.com/${state.current.replace('.', '')}x${state.copies}/ 7@5.com`;
+        state.copied = true;
+        state.clipboard = sameLink ?? `5.38 复制打开抖音 https://v.douyin.com/${state.current.replace('.', '')}x${state.copies}/ 7@5.com`;
       }
     },
     swipe: async () => { state.page = Math.min(state.page + 1, pages.length - 1); },
     back: async () => {
+      state.copied = false;
       if (state.sheet) state.sheet = false;
       else state.screen = 'channel';
     },
@@ -73,10 +85,13 @@ function fakeDevice({ pages, loginAfterOpens = Infinity, loginStaysFor = 1, noLi
         : 'mCurrentFocus=Window{1 com.ss.android.ugc.aweme.detail.ultra.ui.UltraDetailActivity}';
     },
     readScreen: async () => {
+      if (state.copied) return '<node text="链接已复制成功，去粘贴分享：" content-desc="" bounds="[42,1803][954,1861]" />';
       if (state.sheet) return '<node text="分享链接" content-desc="" bounds="[221,2226][400,2270]" />';
-      const rows = pages[state.page].map((label, index) => labelNode(label, 600 + Math.floor(index / 3) * 480, 20 + (index % 3) * 360));
+      if (state.screen === 'video') return '';
+      const rows = pages[state.page].map((label, index) => labelNode(label, 700 + Math.floor(index / 3) * 480, 20 + (index % 3) * 360));
       const backToTop = state.page > 0 ? '<node text="" content-desc="返回顶部" bounds="[0,63][1080,200]" />' : '';
-      return `<node content-desc="作品 34" text="作品 34" bounds="[0,0][1,1]" />${backToTop}${rows.join('')}`;
+      const count = listed ?? pages.at(-1).length;
+      return `<node content-desc="作品 ${count}" text="作品 ${count}" bounds="[0,0][1,1]" />${backToTop}${rows.join('')}`;
     },
   };
   return { device, state };
@@ -112,8 +127,8 @@ test('finds the share link inside copied text', () => {
 
 test('reads grid tiles from like-count labels, scaled to the screen', () => {
   const xml = `${labelNode('6425', 1700, 380)}<node text="登录" content-desc="" bounds="[0,0][9,9]" />${labelNode('hidden', 2500)}${labelNode('above', 100)}`;
-  assert.deepEqual(visibleTiles(xml), [{ label: '6425', x: 510, y: 1540, row: 1700 }]);
-  assert.deepEqual(visibleTiles(labelNode('6425', 1700, 380), 2)[0], { label: '6425', x: 640, y: 1380, row: 1700 });
+  assert.deepEqual(visibleTiles(xml), [{ label: '6425', x: 510, y: 1400, row: 1700 }]);
+  assert.deepEqual(visibleTiles(labelNode('6425', 1700, 380), 2)[0], { label: '6425', x: 640, y: 1100, row: 1700 });
 });
 
 test('skips the row that stays on screen after scrolling', () => {
@@ -121,6 +136,13 @@ test('skips the row that stays on screen after scrolling', () => {
   assert.deepEqual(tilesAfterOverlap(tiles, []).length, 6);
   assert.deepEqual(tilesAfterOverlap(tiles, ['a', 'b', 'c']).map((t) => t.label), ['d', 'e', 'f']);
   assert.deepEqual(tilesAfterOverlap(tiles, ['x', 'y', 'z']).length, 6);
+});
+
+test('never skips tiles on an unclear match, because like counts repeat', () => {
+  const tiles = ['a', 'b', 'c', 'a', 'b', 'd'].map((label) => tile(label));
+  assert.equal(tilesAfterOverlap(tiles, ['b']).length, 6);
+  assert.equal(tilesAfterOverlap(tiles, ['a', 'b']).length, 6);
+  assert.deepEqual(tilesAfterOverlap(tiles, ['b', 'c']).map((t) => t.label), ['a', 'b', 'd']);
 });
 
 test('finds the last row and the channel size', () => {
@@ -132,10 +154,114 @@ test('finds the last row and the channel size', () => {
 });
 
 test('reads the video id and type from the share redirect', async () => {
-  const redirect = (location) => async () => ({ headers: new Headers({ location }) });
+  const redirect = (location) => ({ fetchImpl: async () => ({ headers: new Headers({ location }) }) });
   assert.deepEqual(await resolveShareLink('x', redirect('https://www.iesdouyin.com/share/video/123/?a=1')), { id: '123', isVideo: true });
   assert.deepEqual(await resolveShareLink('x', redirect('https://www.iesdouyin.com/share/note/456/')), { id: '456', isVideo: false });
   assert.deepEqual(await resolveShareLink('x', redirect('https://www.iesdouyin.com/other')), { id: null, isVideo: false });
+});
+
+test('uses only emulators, never a real phone', async () => {
+  const execWith = (devices) => async (adb, args) => {
+    if (args[0] === 'devices') return `List of devices attached\n${devices}\n`;
+    if (args.includes('wm')) return 'Physical size: 1080x2400\n';
+    return '';
+  };
+  await assert.rejects(connectDevice({ adb: 'adb', exec: execWith('R5CT123\tdevice') }), /No Android emulator/);
+
+  const used = [];
+  const exec = execWith('R5CT123\tdevice\nemulator-5554\tdevice');
+  const device = await connectDevice({ adb: 'adb', exec: async (adb, args) => { used.push(args[1]); return exec(adb, args); } });
+  await device.back();
+  assert.ok(used.includes('emulator-5554'));
+  assert.ok(!used.includes('R5CT123'));
+});
+
+test('refuses a screen shape whose button positions are unknown', async () => {
+  const result = await finish(grabWith(fakeDevice({ pages: [['a']], screen: { width: 1080, height: 1920 } })));
+  assert.match(result.error, /1080x1920 screen isn't supported/);
+  const scaled = await finish(grabWith(fakeDevice({ pages: [['a']], screen: { width: 1440, height: 3200 } })));
+  assert.equal(scaled.error, null);
+});
+
+test('keeps a link whose video could not be looked up', async () => {
+  const noId = fakeDevice({ pages: [['a', 'b']] });
+  const silent = await finish(grabWith(noId, { resolve: async () => ({ id: null, isVideo: false }) }));
+  assert.equal(silent.links.length, 2);
+  assert.equal(silent.unverified, 2);
+  assert.equal(silent.missed, 0);
+
+  const offline = fakeDevice({ pages: [['a', 'b']] });
+  const failed = await finish(grabWith(offline, { resolve: async () => { throw new Error('fetch failed'); } }));
+  assert.equal(failed.error, null);
+  assert.equal(failed.links.length, 2);
+});
+
+test('Stop works while a link lookup is hanging', async () => {
+  const fake = fakeDevice({ pages: [['a', 'b']] });
+  let looking = false;
+  const grab = grabWith(fake, {
+    resolve: (link, { signal }) => new Promise((_, reject) => {
+      looking = true;
+      signal.addEventListener('abort', () => reject(signal.reason));
+    }),
+  });
+  while (!looking) await new Promise((resolve) => setTimeout(resolve, 1));
+  grab.stop();
+  assert.equal((await finish(grab)).outcome, 'Stopped.');
+});
+
+test('does not claim the end when the list stops moving early', async () => {
+  const fake = fakeDevice({ pages: [['a', 'b', 'c']], listed: 28 });
+  const result = await finish(grabWith(fake));
+  assert.match(result.outcome, /list stopped moving/);
+  assert.equal(result.links.length, 3);
+});
+
+test('does not claim the end when the screen cannot be read after scrolling', async () => {
+  const fake = fakeDevice({ pages: [['a', 'b', 'c']] });
+  fake.device.swipe = async () => { fake.device.readScreen = async () => ''; };
+  const result = await finish(grabWith(fake));
+  assert.match(result.outcome, /could not read the emulator screen/);
+});
+
+test('checks the screen instead of tapping blindly when the share sheet did not open', async () => {
+  const fake = fakeDevice({ pages: [['a', 'b', 'c']], sheetNeverOpensOnce: true });
+  const result = await finish(grabWith(fake));
+  assert.equal(fake.state.blindCaptionTaps ?? 0, 0);
+  assert.equal(result.links.length, 3);
+});
+
+test('accepts a reused short link when Douyin confirms the copy', async () => {
+  const link = 'https://v.douyin.com/reusedLink/';
+  const fake = fakeDevice({ pages: [['a']], sameLink: `复制打开抖音 ${link}` });
+  fake.state.clipboard = link;
+  const result = await finish(grabWith(fake, { resolve: async () => ({ id: '1', isVideo: true }) }));
+  assert.deepEqual(result.links, [link]);
+  assert.equal(result.missed, 0);
+});
+
+test('backs out of an unexpected screen, like the clipboard editor', async () => {
+  const fake = fakeDevice({ pages: [['a', 'b']] });
+  let overlayOpen = true;
+  const { focusedWindow, back } = fake.device;
+  fake.device.focusedWindow = async () => (overlayOpen
+    ? 'mCurrentFocus=Window{1 com.android.systemui/.clipboardoverlay.EditTextActivity}'
+    : focusedWindow());
+  fake.device.back = async () => {
+    if (overlayOpen) overlayOpen = false;
+    else await back();
+  };
+  const result = await finish(grabWith(fake));
+  assert.equal(result.links.length, 2);
+  assert.equal(result.error, null);
+});
+
+test('reports a tile that only gave a video already collected', async () => {
+  const fake = fakeDevice({ pages: [['a', 'b', 'c']] });
+  const results = [{ id: '1', isVideo: true }, { id: '2', isVideo: true }, { id: '1', isVideo: true }];
+  const result = await finish(grabWith(fake, { resolve: async () => results.shift() }));
+  assert.equal(result.repeats, 1);
+  assert.equal(fake.state.opens, 3); // an older repeat isn't worth opening again
 });
 
 test('adb is found in the Android SDK before falling back to PATH', () => {
@@ -157,7 +283,7 @@ test('collects every link across scrolling pages, opening overlapping tiles once
   assert.match(result.outcome, /end of the list Douyin shows/);
   assert.equal(result.links.length, 6);
   assert.ok(result.links.every((link) => link.startsWith('https://v.douyin.com/')));
-  assert.equal(result.expected, 34);
+  assert.equal(result.expected, 6);
   assert.equal(fake.state.opens, 6);
 });
 

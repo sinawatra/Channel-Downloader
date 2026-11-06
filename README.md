@@ -157,7 +157,9 @@ If you paste grabbed links into another download site, check that site's terms f
 | "may be incomplete" | Run the channel again until the page says it reached the end |
 | The port is already in use | Start with another port: `PORT=4600 npm start` |
 | "Could not run adb" | Install Android Studio, or set `ANDROID_HOME` to your Android SDK folder |
-| "No Android emulator is running" | Start an emulator in Android Studio, then try again |
+| "No Android emulator is running" | Start an emulator in Android Studio, then try again. The grabber never uses a real phone |
+| "screen isn't supported" | Use an emulator shaped like 1080x2400, such as Medium Phone. Other shapes put Douyin's buttons elsewhere |
+| "the list stopped moving" | Run it again. If it keeps happening, scroll the channel once by hand in the emulator first |
 | "several videos in a row gave no link" | Check that the emulator's clipboard sharing is on and that nothing is covering Douyin, then run it again |
 
 ## Development

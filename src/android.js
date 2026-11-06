@@ -49,8 +49,9 @@ export async function connectDevice({ adb = findAdb(), exec = run } = {}) {
   } catch {
     throw new Error('Could not run adb. Install Android Studio, or set ANDROID_HOME to your Android SDK folder.');
   }
-  const serial = devices[0];
-  if (!serial) throw new Error('No Android emulator is running. Start one, then try again.');
+  // Blind taps and back presses must never reach someone's real phone.
+  const serial = devices.find((device) => device.startsWith('emulator-'));
+  if (!serial) throw new Error('No Android emulator is running. Start one, then try again. Real phones are not used.');
 
   const shell = (...args) => exec(adb, ['-s', serial, 'shell', ...args]);
   const screen = parseScreenSize(await shell('wm', 'size')) ?? { width: 1080, height: 2400 };
@@ -63,6 +64,10 @@ export async function connectDevice({ adb = findAdb(), exec = run } = {}) {
     back: () => shell('input', 'keyevent', '4'),
     async focusedWindow() {
       return (await shell('dumpsys', 'window')).match(/mCurrentFocus=.*/)?.[0] ?? '';
+    },
+    // Much faster than reading the screen, and a share sheet adds a window.
+    async windowCount() {
+      return (await shell('dumpsys', 'window', 'windows')).match(/Window #\d+/g)?.length ?? 0;
     },
     // Fails while a video is playing, because the screen never goes idle.
     async readScreen() {
